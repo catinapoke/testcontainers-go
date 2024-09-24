@@ -22,16 +22,8 @@ func TestKafka_Basic(t *testing.T) {
 	ctx := context.Background()
 
 	kafkaContainer, err := kafka.Run(ctx, "confluentinc/confluent-local:7.5.0", kafka.WithClusterID("kraftCluster"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Clean up the container after the test is complete
-	t.Cleanup(func() {
-		if err := kafkaContainer.Terminate(ctx); err != nil {
-			t.Fatalf("failed to terminate container: %s", err)
-		}
-	})
+	testcontainers.CleanupContainer(t, kafkaContainer)
+	require.NoError(t, err)
 
 	assertAdvertisedListeners(t, kafkaContainer)
 
@@ -42,17 +34,14 @@ func TestKafka_Basic(t *testing.T) {
 	// getBrokers {
 	brokers, err := kafkaContainer.Brokers(ctx)
 	// }
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	config := sarama.NewConfig()
 	client, err := sarama.NewConsumerGroup(brokers, "groupName", config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	consumer, ready, done, cancel := NewTestKafkaConsumer(t)
+	defer cancel()
 	go func() {
 		if err := client.Consume(context.Background(), []string{topic}, consumer); err != nil {
 			cancel()
@@ -68,19 +57,14 @@ func TestKafka_Basic(t *testing.T) {
 	config.Producer.Return.Successes = true
 
 	producer, err := sarama.NewSyncProducer(brokers, config)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	if _, _, err := producer.SendMessage(&sarama.ProducerMessage{
+	_, _, err = producer.SendMessage(&sarama.ProducerMessage{
 		Topic: topic,
 		Key:   sarama.StringEncoder("key"),
 		Value: sarama.StringEncoder("value"),
-	}); err != nil {
-		cancel()
-		t.Fatal(err)
-	}
+	})
+	require.NoError(t, err)
 
 	<-done
 
@@ -95,10 +79,9 @@ func TestKafka_Basic(t *testing.T) {
 func TestKafka_invalidVersion(t *testing.T) {
 	ctx := context.Background()
 
-	_, err := kafka.Run(ctx, "confluentinc/confluent-local:6.3.3", kafka.WithClusterID("kraftCluster"))
-	if err == nil {
-		t.Fatal(err)
-	}
+	ctr, err := kafka.Run(ctx, "confluentinc/confluent-local:6.3.3", kafka.WithClusterID("kraftCluster"))
+	testcontainers.CleanupContainer(t, ctr)
+	require.Error(t, err)
 }
 
 func TestKafka_networkConnectivity(t *testing.T) {
@@ -138,28 +121,11 @@ func TestKafka_networkConnectivity(t *testing.T) {
 	// }
 	require.NoError(t, err, "failed to start kafka container")
 
-	kcat, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image: "confluentinc/cp-kcat:7.4.1",
-			Networks: []string{
-				Network.Name,
-			},
-			Entrypoint: []string{
-				"sh",
-			},
-			Cmd: []string{
-				"-c",
-				"tail -f /dev/null",
-			},
-		},
-		Started: true,
-	})
-	// }
-
+	kcat, err := createKCat(ctx, Network.Name, "/tmp/msgs.txt")
 	require.NoError(t, err, "failed to start kcat")
 
 	// 4. Copy message to kcat
-	err = kcat.CopyToContainer(ctx, []byte("Message produced by kcat"), "/tmp/msgs.txt", 700)
+	err = kcat.CopyToContainer(ctx, []byte("Message produced by kcat"), kcat.FilePath, 700)
 	require.NoError(t, err)
 
 	brokers, err := KafkaContainer.Brokers(context.TODO())
@@ -263,34 +229,16 @@ func TestKafka_withListener(t *testing.T) {
 	require.NoError(t, err)
 
 	// 3. Start KCat container
-	// withListenerKcat {
-	kcat, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image: "confluentinc/cp-kcat:7.4.1",
-			Networks: []string{
-				rpNetwork.Name,
-			},
-			Entrypoint: []string{
-				"sh",
-			},
-			Cmd: []string{
-				"-c",
-				"tail -f /dev/null",
-			},
-		},
-		Started: true,
-	})
-	// }
-
+	kcat, err := createKCat(ctx, rpNetwork.Name, "/tmp/msgs.txt")
 	require.NoError(t, err)
 
 	// 4. Copy message to kcat
-	err = kcat.CopyToContainer(ctx, []byte("Message produced by kcat"), "/tmp/msgs.txt", 700)
+	err = kcat.CopyToContainer(ctx, []byte("Message produced by kcat"), kcat.FilePath, 700)
 	require.NoError(t, err)
 
 	// 5. Produce message to Kafka
 	// withListenerExec {
-	_, _, err = kcat.Exec(ctx, []string{"kcat", "-b", "kafka:9092", "-t", "msgs", "-P", "-l", "/tmp/msgs.txt"})
+	_, _, err = kcat.Exec(ctx, []string{"kcat", "-b", "kafka:9092", "-t", "msgs", "-P", "-l", kcat.FilePath})
 	// }
 
 	require.NoError(t, err)
@@ -446,24 +394,17 @@ func createTopics(brokers []string, topics []string) error {
 // - The BROKER:// protocol is using the hostname of the Kafka container
 func assertAdvertisedListeners(t *testing.T, container testcontainers.Container) {
 	inspect, err := container.Inspect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	hostname := inspect.Config.Hostname
 
 	code, r, err := container.Exec(context.Background(), []string{"cat", "/usr/sbin/testcontainers_start.sh"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	if code != 0 {
-		t.Fatalf("expected exit code to be 0, got %d", code)
-	}
+	require.Zero(t, code)
 
 	bs, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	if !strings.Contains(string(bs), "BROKER://"+hostname+":9092") {
 		t.Fatalf("expected advertised listeners to contain %s, got %s", "BROKER://"+hostname+":9092", string(bs))
